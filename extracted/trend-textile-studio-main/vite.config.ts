@@ -12,4 +12,10 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  vite: {
+    server: {
+      // Allow the sandbox preview proxy host (and any tunnel host) in dev.
+      allowedHosts: true,
+    },
+  },
 });
