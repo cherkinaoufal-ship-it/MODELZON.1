@@ -53,9 +53,16 @@ export interface BrushSettings {
   opacity: number; // 0..1
   spacing: number; // 0.05..1 of size
   lineStyle: LineStyle;
+  /** Auto-mirror strokes — MUST stay false by default (see the mirror-bug
+   *  note in drawSegment). Only turns on when the person taps the dedicated
+   *  "تماثل" toggle themselves. */
   symmetry: boolean;
   font: string;
   text: string;
+  /** Smudge tool: how strongly colors get picked up and dragged (0..1). */
+  smudgeStrength: number;
+  /** Smudge tool: its own brush-head size, independent of the paint size. */
+  smudgeSize: number;
 }
 
 export const DEFAULT_BRUSH: BrushSettings = {
@@ -69,6 +76,8 @@ export const DEFAULT_BRUSH: BrushSettings = {
   symmetry: false,
   font: "Impact",
   text: "MODELZON",
+  smudgeStrength: 0.6,
+  smudgeSize: 44,
 };
 
 export interface Pt {
@@ -490,6 +499,60 @@ export function newStroke(): StrokeState {
   return { i: 0, last: null };
 }
 
+/* ------------------------------------------------------------------ */
+/* smudge — real pixel pick-up & drag, with a soft Gaussian edge       */
+/* ------------------------------------------------------------------ */
+
+/** Shared scratch canvas for the smudge reservoir (tiny — brush-sized). */
+let smudgeScratch: HTMLCanvasElement | null = null;
+
+/** One smudge stamp: copies the pixels under `from`, soft-masks them into a
+ *  circular reservoir, then re-prints them (slightly blurred) at `to`.
+ *  Repeated along the pointer path this is a genuine smudge/blur brush —
+ *  colors under the cursor are picked up, blended and dragged along, like
+ *  a finger through wet paint — instead of the old fake "low-alpha smear
+ *  of the stroke color". Operates only on a brush-sized rectangle of the
+ *  layer canvas, so it stays real-time even on mid-range devices. */
+function smudgeStamp(
+  ctx: CanvasRenderingContext2D,
+  from: Pt,
+  to: Pt,
+  s: BrushSettings,
+) {
+  const size = Math.max(6, s.smudgeSize);
+  const d = Math.ceil(size * 1.25);
+  if (!smudgeScratch) smudgeScratch = document.createElement("canvas");
+  if (smudgeScratch.width !== d || smudgeScratch.height !== d) {
+    smudgeScratch.width = d;
+    smudgeScratch.height = d;
+  }
+  const tctx = smudgeScratch.getContext("2d");
+  if (!tctx) return;
+  tctx.clearRect(0, 0, d, d);
+
+  // 1) pick up what's currently under the previous point
+  const sx = Math.round(from.x - d / 2);
+  const sy = Math.round(from.y - d / 2);
+  tctx.drawImage(ctx.canvas, sx, sy, d, d, 0, 0, d, d);
+
+  // 2) soft circular mask (strength = how much the reservoir holds)
+  tctx.globalCompositeOperation = "destination-in";
+  const m = tctx.createRadialGradient(d / 2, d / 2, 0, d / 2, d / 2, d / 2);
+  m.addColorStop(0, `rgba(0,0,0,${Math.min(1, Math.max(0.05, s.smudgeStrength))})`);
+  m.addColorStop(0.7, `rgba(0,0,0,${Math.min(1, Math.max(0.03, s.smudgeStrength * 0.6))})`);
+  m.addColorStop(1, "rgba(0,0,0,0)");
+  tctx.fillStyle = m;
+  tctx.fillRect(0, 0, d, d);
+  tctx.globalCompositeOperation = "source-over";
+
+  // 3) print the reservoir at the new position with a soft blur — the blur
+  //    radius scales with strength, so 100% feels like pushing wet paint
+  ctx.save();
+  ctx.filter = `blur(${Math.max(0.5, size * 0.03 + s.smudgeStrength * size * 0.05)}px)`;
+  ctx.drawImage(smudgeScratch, Math.round(to.x - d / 2), Math.round(to.y - d / 2));
+  ctx.restore();
+}
+
 /** Draws one interpolated segment. Returns updated stroke state. */
 export function drawSegment(
   ctx: CanvasRenderingContext2D,
@@ -503,6 +566,23 @@ export function drawSegment(
   const d = dist(from, to);
   const n = Math.max(1, Math.ceil(d / step));
   const angle = d < 0.001 ? 0 : ang(from, to);
+
+  // Smudge gets its own interpolated path (denser spacing — the whole point
+  // is a continuous smear, not separated dabs).
+  if (s.tool === "smudge") {
+    const smStep = Math.max(2, s.smudgeSize * 0.3);
+    const steps = Math.max(1, Math.ceil(d / smStep));
+    let prev = from;
+    for (let k = 1; k <= steps; k++) {
+      const t = k / steps;
+      const p: Pt = { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+      smudgeStamp(ctx, prev, p, s);
+      prev = p;
+    }
+    state.i += steps;
+    state.last = to;
+    return;
+  }
 
   const stamp = STAMPS[s.brush] ?? STAMPS.pen;
 
@@ -522,15 +602,6 @@ export function drawSegment(
       ctx.beginPath();
       ctx.arc(p.x, p.y, s.size / 2, 0, Math.PI * 2);
       ctx.fill();
-    } else if (s.tool === "smudge") {
-      // cheap but convincing smudge: soft low-alpha smear of the stroke color
-      const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, s.size);
-      g.addColorStop(0, rgba(s.color, 0.08 * s.opacity));
-      g.addColorStop(1, rgba(s.color, 0));
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, s.size, 0, Math.PI * 2);
-      ctx.fill();
     } else {
       stamp(ctx, p, angle, s, idx);
     }
@@ -542,6 +613,11 @@ export function drawSegment(
     }
 
     if (s.symmetry) {
+      // EXPLICIT user opt-in only — DEFAULT_BRUSH.symmetry is false and
+      // nothing in the UI turns it on automatically. With it off, a stroke
+      // on one side of the garment can NEVER appear mirrored on the other
+      // side (each sleeve/leg also reads its own corner of the texture —
+      // see remapUvToCorner in Studio3D.tsx).
       const mp: Pt = { x: canvasWidth - p.x, y: p.y };
       if (s.tool === "eraser") {
         ctx.beginPath();
@@ -687,6 +763,12 @@ export const FONTS = [
   "Tahoma",
   "Palatino Linotype",
   "Brush Script MT",
+  // Arabic-first fonts (loaded via Google Fonts in styles.css) — they also
+  // cover Latin, so they're safe picks for mixed ar/en text elements.
+  "Cairo",
+  "Tajawal",
+  "Amiri",
+  "Reem Kufi",
 ];
 
 export const LINE_STYLES: { id: LineStyle; en: string; ar: string }[] = [

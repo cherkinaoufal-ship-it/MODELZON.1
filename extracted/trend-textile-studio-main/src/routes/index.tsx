@@ -7,6 +7,11 @@ import { requestProduction } from "@/lib/production";
 import type { ProductionMeasurements } from "@/lib/production";
 import ProductionRequestDialog from "@/components/modelzon/ProductionRequestDialog";
 import { listFriends, addFriend, removeFriend, FRIEND_LIMIT } from "@/lib/friends.functions";
+import {
+  sendFriendRequest, respondFriendRequest, listIncomingFriendRequests, getOutgoingFriendRequest,
+  type FriendRequestSummary,
+} from "@/lib/friendRequests.functions";
+import ApiKeysPanel from "@/components/modelzon/ApiKeysPanel";
 import { DECORATION_TYPES, type DecorationTypeId, type FabricTypeId } from "@/lib/materialPresets";
 
 import MyShopCard from "@/components/modelzon/MyShopCard";
@@ -20,7 +25,8 @@ import {
   Palette as PaletteIcon, Swords, Store, Library, Brush, Clapperboard,
   Snowflake, Sun, CheckCircle2, Circle, Camera, Factory, Users,
   Image as ImageIcon, LayoutGrid, RotateCw, PersonStanding, Footprints, Wind,
-  CreditCard, Grid3x3, SlidersHorizontal, Shield, Sticker, Upload,
+  CreditCard, Grid3x3, SlidersHorizontal, Shield, Sticker, Upload, Plus,
+  Printer, Hourglass, Check, UserPlus,
 } from "lucide-react";
 import ChatPanel from "@/components/modelzon/ChatPanel";
 import ShortsFeed from "@/components/modelzon/ShortsFeed";
@@ -28,10 +34,16 @@ import ProToolbar from "@/components/modelzon/ProToolbar";
 import ColorPickerHSV from "@/components/modelzon/ColorPickerHSV";
 import DecorationIcon from "@/components/modelzon/DecorationIcon";
 import GarmentPartsSheet from "@/components/modelzon/GarmentPartsSheet";
-import MockupBoard2D, { type MockupSide, type MockupSlot } from "@/components/modelzon/MockupBoard2D";
+import MockupBoard2D from "@/components/modelzon/MockupBoard2D";
+import { VideoUploadDialog, VideoUploadPicker } from "@/components/modelzon/VideoUpload";
+
+import {
+  composeElements, ensureImagesLoaded, newImageElement, panelDesignToTexture,
+  type DesignElement, type PanelId,
+} from "@/lib/designElements";
 
 import { DEFAULT_BRUSH, type BrushSettings } from "@/lib/paint-engine";
-import { DEFAULT_DECAL_TRANSFORM, type DecalTransform } from "@/components/modelzon/DecalControls";
+import { DEFAULT_DECAL_TRANSFORM } from "@/components/modelzon/DecalControls";
 
 import SettingsPanel from "@/components/modelzon/SettingsPanel";
 import XPBar from "@/components/modelzon/XPBar";
@@ -80,6 +92,9 @@ export const Route = createFileRoute("/")({
 });
 
 type TabId = "studio" | "arena" | "styles" | "feed" | "market" | "ranks" | "profile";
+/** Pseudo-tab id for the bottom-bar "+" upload action (§2) — never an
+ *  actual screen, but it rides the NAV array for ordering/gating. */
+type NavId = TabId | "upload";
 
 const GARMENTS: { id: GarmentType; label: string; icon: any }[] = [
   { id: "tee", label: "Tee", icon: Shirt },
@@ -110,10 +125,16 @@ const OWNER_PIN = "2580";
  * in this project).
  */
 
-const NAV: { id: TabId; icon: any; en: string; ar: string; minLevel?: number }[] = [
+const NAV: { id: NavId; icon: any; en: string; ar: string; minLevel?: number; mobileOnly?: boolean; desktopOnly?: boolean }[] = [
   { id: "studio", icon: Shirt, en: "Studio", ar: "الاستوديو" },
   { id: "arena", icon: Swords, en: "Arena", ar: "الساحة" },
-  { id: "styles", icon: Library, en: "Garments", ar: "الملابس" },
+  // §2 — the big gradient "+" in the MIDDLE of the mobile bottom bar:
+  // opens the shared video-upload flow (gallery vs camera), then jumps to
+  // Reels after posting. It's not a tab — it's an action.
+  { id: "upload", icon: Plus, en: "Upload", ar: "رفع", mobileOnly: true },
+  // Desktop keeps the Garments library link in the sidebar (the mobile
+  // bottom bar doesn't need it — the Studio's own garment picker covers it).
+  { id: "styles", icon: Library, en: "Garments", ar: "الملابس", desktopOnly: true },
   { id: "feed", icon: Clapperboard, en: "Reels", ar: "ريلز" },
   // Hidden from the bottom bar until Level 50 (or Elite) — same gate as
   // marketplace selling itself (see 003_marketplace.sql) — then it just
@@ -153,19 +174,24 @@ function Modelzon() {
   const [fabricType] = useState<FabricTypeId>("cotton");
   const [decorationType, setDecorationType] = useState<DecorationTypeId>("screen");
   const [decorationTypeBack, setDecorationTypeBack] = useState<DecorationTypeId>("screen");
+  // decalUrl / decalUrlBack are DERIVED now: they hold the pretty per-side
+  // composites of the element list below (used by saving, the marketplace,
+  // battles and thumbnails). The 3D garment itself reads the RAW full-canvas
+  // overlays (overlayFront/BackUrl → Studio3D) — see lib/designElements.ts.
   const [decalUrl, setDecalUrl] = useState<string | null>(null);
-  const [decalHistory, setDecalHistory] = useState<(string | null)[]>([null]);
-  const [decalTransform, setDecalTransform] = useState<DecalTransform>(DEFAULT_DECAL_TRANSFORM);
   const [decalUrlBack, setDecalUrlBack] = useState<string | null>(null);
-  const [decalTransformBack, setDecalTransformBack] = useState<DecalTransform>(DEFAULT_DECAL_TRANSFORM);
-  const [decalSide, setDecalSide] = useState<MockupSide>("front");
-  const [studioPanel, setStudioPanel] = useState<"garments" | "artwork" | "fit" | "ai" | "paint" | "bg" | "layout">("garments");
+  // The design elements themselves (images + text) — the single source of
+  // truth for everything placed on the mockup panels (§1/§4/§7).
+  const [elements, setElements] = useState<DesignElement[]>([]);
+  const elementImagesRef = useRef(new Map<string, HTMLImageElement>());
+  const [overlayFront, setOverlayFront] = useState<string | null>(null);
+  const [overlayBack, setOverlayBack] = useState<string | null>(null);
+  const [decalSide, setDecalSide] = useState<PanelId>("front");
+  const [studioPanel, setStudioPanel] = useState<"garments" | "artwork" | "fit" | "ai" | "paint" | "print" | "bg" | "layout">("garments");
   const [partsSheetOpen, setPartsSheetOpen] = useState(false);
-  // Sleeve/leg panels of the 2D mockup board — layout-only artwork slots for
-  // now (catalog .glb models carry artist UVs, so there's no reliable sleeve
-  // print area on the 3D mesh). Front/back stay the real 3D-backed slots.
-  const [sleeveSlotL, setSleeveSlotL] = useState<MockupSlot>({ url: null, transform: DEFAULT_DECAL_TRANSFORM });
-  const [sleeveSlotR, setSleeveSlotR] = useState<MockupSlot>({ url: null, transform: DEFAULT_DECAL_TRANSFORM });
+  // §2 — bottom-bar "+" upload flow state (shared VideoUpload components).
+  const [navUploadOpen, setNavUploadOpen] = useState(false);
+  const [navUploadFile, setNavUploadFile] = useState<File | null>(null);
 
   const [studioBg, setStudioBg] = useState("#000000");
   const [profileTab, setProfileTab] = useState<"designs" | "plan" | "payouts" | "friends" | "settings">("designs");
@@ -242,11 +268,33 @@ function Modelzon() {
   const listFriendsFn = useServerFn(listFriends);
   const addFriendFn = useServerFn(addFriend);
   const removeFriendFn = useServerFn(removeFriend);
+  // "+" add-friend button state on the inspection card (§9b). Declared
+  // here — before the handlers — because both the friends block and the
+  // viewer card read it.
+  const [friendReqState, setFriendReqState] = useState<"idle" | "sending" | "pending" | "friends">("idle");
+  // §9b — friend requests (30-day expiry handled server-side).
+  const sendRequestFn = useServerFn(sendFriendRequest);
+  const respondRequestFn = useServerFn(respondFriendRequest);
+  const listIncomingFn = useServerFn(listIncomingFriendRequests);
+  const outgoingStatusFn = useServerFn(getOutgoingFriendRequest);
+  const [friendRequests, setFriendRequests] = useState<FriendRequestSummary[]>([]);
 
   const refreshFriends = useCallback(async () => {
     if (!user) return;
     try { setFriends(await listFriendsFn({ data: { userId: user.id } }) as any); } catch { /* non-critical */ }
-  }, [user, listFriendsFn]);
+    try { setFriendRequests(await listIncomingFn({ data: { userId: user.id } }) as FriendRequestSummary[]); } catch { /* table may not be migrated yet */ }
+  }, [user, listFriendsFn, listIncomingFn]);
+
+  const handleRespondRequest = useCallback(async (requestId: string, accept: boolean) => {
+    if (!user) return;
+    try {
+      await respondRequestFn({ data: { requestId, userId: user.id, accept } });
+      if (accept) toast.success(t("Friend added 🎉", "تمت إضافة الصديق 🎉"));
+      void refreshFriends();
+    } catch (e: any) {
+      toast.error(e?.message ?? t("Couldn't answer the request", "تعذّر الرد على الطلب"));
+    }
+  }, [user, respondRequestFn, refreshFriends]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { if (user && tab === "profile") void refreshFriends(); }, [user?.id, tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -264,6 +312,27 @@ function Modelzon() {
       setAddingFriend(false);
     }
   }, [user, friendIdInput, addFriendFn, refreshFriends]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleSendFriendRequest = useCallback(async (targetId: string) => {
+    if (!user || friendReqState === "sending" || friendReqState === "pending" || friendReqState === "friends") return;
+    setFriendReqState("sending");
+    try {
+      const res = await sendRequestFn({ data: { userId: user.id, targetId } });
+      if (res.status === "accepted") {
+        setFriendReqState("friends");
+        toast.success(t("You're now friends 🎉", "صرتما أصدقاء 🎉"));
+        void refreshFriends();
+      } else {
+        setFriendReqState("pending");
+        toast.success(t("Friend request sent — waits 30 days for their answer ⏳", "تم إرسال طلب الصداقة — ينتظر ردهم 30 يوم ⏳"));
+      }
+    } catch (e: any) {
+      setFriendReqState("idle");
+      const msg = String(e?.message ?? "");
+      if (msg.includes("Already in your clan")) { setFriendReqState("friends"); return; }
+      toast.error(msg || t("Couldn't send the request", "تعذّر إرسال الطلب"));
+    }
+  }, [user, friendReqState, sendRequestFn, refreshFriends]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleRemoveFriend = useCallback(async (friendId: string) => {
     if (!user) return;
@@ -285,8 +354,8 @@ function Modelzon() {
       const saveResult = await saveDesign({
         userId: user.id,
         garment, size, color,
-        decalUrl, decalTransform: decalUrl ? decalTransform : null,
-        decalUrlBack, decalTransformBack: decalUrlBack ? decalTransformBack : null,
+        decalUrl, decalTransform: decalUrl ? DEFAULT_DECAL_TRANSFORM : null,
+        decalUrlBack, decalTransformBack: decalUrlBack ? DEFAULT_DECAL_TRANSFORM : null,
         title: `${garment} · ${topic}`.slice(0, 80),
         paintDataUrl: studioRef.current?.getPaintDataUrl() ?? null,
       });
@@ -309,7 +378,7 @@ function Modelzon() {
     } else {
       toast.error(result.message ?? t("Couldn't send request", "تعذّر إرسال الطلب"));
     }
-  }, [user, lang, productionDesignId, garment, size, color, decalUrl, decalTransform, decalUrlBack, decalTransformBack, topic]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [user, lang, productionDesignId, garment, size, color, decalUrl, decalUrlBack, topic]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const [subscribeDialogOpen, setSubscribeDialogOpen] = useState(false);
   const [battleActive, setBattleActive] = useState(false);
@@ -322,12 +391,16 @@ function Modelzon() {
   const [viewedAvatar, setViewedAvatar] = useState<string | null>(null);
   const [viewedPrivate, setViewedPrivate] = useState(false);
   const [viewedDesigns, setViewedDesigns] = useState<SavedDesign[]>([]);
+  // §9 — inspection card: content toggles (designs/videos), the shorts
+  // themselves, and the "+" add-friend button state (idle/hourglass/friend).
+  const [viewedSection, setViewedSection] = useState<"designs" | "videos">("designs");
+  const [viewedShorts, setViewedShorts] = useState<{ id: string; video_url: string }[]>([]);
 
   // Load the tapped player's public card: bio + avatar always, saved designs
   // only when their Privacy switch is OFF (RLS enforces this server-side too).
   useEffect(() => {
     const id = viewingPlayer?.id;
-    if (!id) { setViewedBio(""); setViewedAvatar(null); setViewedDesigns([]); setViewedPrivate(false); return; }
+    if (!id) { setViewedBio(""); setViewedAvatar(null); setViewedDesigns([]); setViewedPrivate(false); setViewedShorts([]); setViewedSection("designs"); setFriendReqState("idle"); return; }
     let cancelled = false;
     void (async () => {
       const { data } = await supabase.from("profiles").select("bio, avatar_url, is_private").eq("id", id).maybeSingle();
@@ -344,9 +417,24 @@ function Modelzon() {
         .order("created_at", { ascending: false })
         .limit(9);
       if (!cancelled) setViewedDesigns((designs ?? []) as SavedDesign[]);
+      // Their public reels (§9 — videos icon on the inspection card).
+      const { data: shorts } = await supabase
+        .from("shorts")
+        .select("id, video_url")
+        .eq("user_id", id)
+        .order("created_at", { ascending: false })
+        .limit(9);
+      if (!cancelled) setViewedShorts((shorts ?? []) as { id: string; video_url: string }[]);
+      // Am I already waiting on a friend request to them? (hourglass state)
+      if (id !== user?.id) {
+        try {
+          const res = await outgoingStatusFn({ data: { userId: user!.id, targetId: id } });
+          if (!cancelled && res.status === "pending") setFriendReqState("pending");
+        } catch { /* requests table not migrated yet — plain "+" */ }
+      }
     })();
     return () => { cancelled = true; };
-  }, [viewingPlayer?.id, user?.id]);
+  }, [viewingPlayer?.id, user?.id, outgoingStatusFn]); // eslint-disable-line react-hooks/exhaustive-deps
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
 
   useEffect(() => {
@@ -588,9 +676,9 @@ function Modelzon() {
       size,
       color,
       decalUrl,
-      decalTransform: decalUrl ? decalTransform : null,
+      decalTransform: decalUrl ? DEFAULT_DECAL_TRANSFORM : null,
       decalUrlBack,
-      decalTransformBack: decalUrlBack ? decalTransformBack : null,
+      decalTransformBack: decalUrlBack ? DEFAULT_DECAL_TRANSFORM : null,
       title: `${garment} · ${topic}`.slice(0, 80),
       paintDataUrl: studioRef.current?.getPaintDataUrl() ?? null,
     });
@@ -604,7 +692,7 @@ function Modelzon() {
     } else {
       toast.error(lang === "ar" ? "تعذّر حفظ التصميم، حاول مرة ثانية" : "Couldn't save the design, try again");
     }
-  }, [user, garment, size, color, decalUrl, decalTransform, decalUrlBack, decalTransformBack, topic, lang, refreshDesigns]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [user, garment, size, color, decalUrl, decalUrlBack, topic, lang, refreshDesigns]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleDeleteDesign = useCallback(async (id: string) => {
     const removed = await deleteDesign(id);
@@ -691,47 +779,45 @@ function Modelzon() {
   const changeGarment = (g: GarmentType) => { setGarment(g); setModelPath(null); };
   const changeColor = (c: string) => { setColor(c); };
 
-  // One shared entry point for putting artwork on the design — used by the
-  // purple garment-parts picker, the mockup-board upload button, the Paint
-  // panel upload and the AI assistant. It routes to whichever mockup panel
-  // is active: front & back are the real 3D-backed decal slots (anything
-  // added there shows up on the 3D garment automatically), the two
-  // sleeve/leg panels are layout-only slots.
-  const applyArtworkToSide = useCallback((dataUrl: string) => {
-    if (decalSide === "back") {
-      setDecalUrlBack(dataUrl);
-      setDecalTransformBack(DEFAULT_DECAL_TRANSFORM);
-    } else if (decalSide === "sleeveL") {
-      setSleeveSlotL({ url: dataUrl, transform: DEFAULT_DECAL_TRANSFORM });
-    } else if (decalSide === "sleeveR") {
-      setSleeveSlotR({ url: dataUrl, transform: DEFAULT_DECAL_TRANSFORM });
-    } else {
-      setDecalHistory((h) => [...h, decalUrl]);
-      setDecalUrl(dataUrl);
-      setDecalTransform(DEFAULT_DECAL_TRANSFORM);
-    }
-  }, [decalSide, decalUrl]);
-
-  const addPartToDesign = applyArtworkToSide;
-
-  // Mockup-board slot plumbing (drag/resize/rotate on the 2D panels).
-  const mockupSlots: Record<MockupSide, MockupSlot> = {
-    front: { url: decalUrl, transform: decalTransform },
-    back: { url: decalUrlBack, transform: decalTransformBack },
-    sleeveL: sleeveSlotL,
-    sleeveR: sleeveSlotR,
-  };
-  const setMockupTransform = useCallback((s: MockupSide, t: DecalTransform) => {
-    if (s === "front") setDecalTransform(t);
-    else if (s === "back") setDecalTransformBack(t);
-    else if (s === "sleeveL") setSleeveSlotL((v) => ({ ...v, transform: t }));
-    else setSleeveSlotR((v) => ({ ...v, transform: t }));
+  // ---- Element system (§1/§4/§7) ----
+  // One shared entry point for putting artwork on the design: routes to the
+  // given mockup panel. Front & back (and the sleeve corners) all sync to
+  // the 3D garment automatically through the overlay compositor below.
+  const addElementToPanel = useCallback((panel: PanelId, dataUrl: string, aspect = 1) => {
+    setElements((els) => [...els, newImageElement(panel, dataUrl, aspect)]);
+    setDecalSide(panel);
   }, []);
-  const removeMockupArtwork = useCallback((s: MockupSide) => {
-    if (s === "front") { setDecalUrl(null); setDecalTransform(DEFAULT_DECAL_TRANSFORM); }
-    else if (s === "back") { setDecalUrlBack(null); setDecalTransformBack(DEFAULT_DECAL_TRANSFORM); }
-    else if (s === "sleeveL") setSleeveSlotL({ url: null, transform: DEFAULT_DECAL_TRANSFORM });
-    else setSleeveSlotR({ url: null, transform: DEFAULT_DECAL_TRANSFORM });
+
+  // Debounced recomposition: dragging an element fires dozens of patches a
+  // second, and compositing two 1024² canvases + toDataURL isn't free — a
+  // short trailing debounce keeps the 3D view live without jank.
+  useEffect(() => {
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void ensureImagesLoaded(elements, elementImagesRef.current).then(() => {
+        if (cancelled) return;
+        const result = composeElements(
+          elements,
+          { get: (src) => elementImagesRef.current.get(src) },
+          decorationType,
+          decorationTypeBack,
+        );
+        setOverlayFront(result.frontOverlayUrl);
+        setOverlayBack(result.backOverlayUrl);
+        setDecalUrl(result.frontPrettyUrl);
+        setDecalUrlBack(result.backPrettyUrl);
+      });
+    }, 70);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [elements, decorationType, decorationTypeBack]);
+
+  // Drawing on a mockup panel paints the REAL 3D texture region for that
+  // panel (expanded editor draw mode — §7). Note: this never flips the
+  // global brush tool, so orbiting the 3D garment stays available while a
+  // paint session is live on the 2D board.
+  const handleMockupPaint = useCallback((panel: PanelId, dx: number, dy: number, down: boolean) => {
+    const { u, v } = panelDesignToTexture(panel, dx, dy);
+    studioRef.current?.paintAtTexturePoint(u, v, down);
   }, []);
 
   const applyGarment = useCallback((item: GarmentItem) => {
@@ -744,21 +830,17 @@ function Modelzon() {
     // (no XP for browsing the clothing library — missions reward real design work, see progress.functions.ts)
   }, []);
 
-  const aiApply = useCallback((g: GarmentType, c: string) => {
-    setGarment(g); setColor(c); setModelPath(null); setTab("studio"); setAiOpen(false); setStudioPanel("artwork");
+  // AI stylist now returns real generated artwork — drop it on the active
+  // mockup panel as a fully-controllable element.
+  const aiApplyDesign = useCallback((imageUrl: string) => {
+    addElementToPanel(decalSide === "back" ? "back" : "front", imageUrl);
+    setAiOpen(false);
+    toast(lang === "ar" ? "تم تطبيق التصميم على القطعة ✨ عدّلها من تبويب الموك اب" : "Design applied ✨ tweak it in the Mockups tab");
     // (AI-generated art counts toward "Save your first design" once saved — no separate XP just for generating)
-  }, []);
+  }, [addElementToPanel, decalSide, lang]);
 
-  const handleUploadImage = applyArtworkToSide;
-
-  const handleUndo = () => {
-    setDecalHistory((h) => {
-      if (h.length === 0) return h;
-      const prev = h[h.length - 1];
-      setDecalUrl(prev);
-      return h.slice(0, -1);
-    });
-  };
+  // (Element-level undo is simply deleting the element; paint undo stays on
+  //  the shared undoSignal pipeline — see the Print tab & paint panel.)
 
   const presenceStatus = (() => {
     switch (tab) {
@@ -784,6 +866,8 @@ function Modelzon() {
   const verified = level >= 50 || profile?.subscription_tier === "elite" || profile?.subscription_tier === "pro"; // Pro tier's "instant verified checkmark" perk
 
   const visibleNav = NAV.filter((n) => !n.minLevel || level >= n.minLevel || profile?.subscription_tier === "elite");
+  const desktopNav = visibleNav.filter((n) => !n.mobileOnly);
+  const bottomNav = visibleNav.filter((n) => !n.desktopOnly);
   // If someone is on the (now-hidden) Market tab and hasn't unlocked it,
   // bounce them somewhere they can actually see — otherwise the content
   // area could render a tab with no visible way back to it.
@@ -819,7 +903,7 @@ function Modelzon() {
       <GarmentPartsSheet
         open={partsSheetOpen}
         onClose={() => setPartsSheetOpen(false)}
-        onPick={(dataUrl) => addPartToDesign(dataUrl)}
+        onPick={(dataUrl, _label) => addElementToPanel(decalSide, dataUrl)}
         ar={lang === "ar"}
       />
       <header className="relative z-30 flex items-center gap-3 px-4 py-3 border-b border-white/10 bg-black/40 backdrop-blur-xl">
@@ -855,13 +939,13 @@ function Modelzon() {
               <XPBar level={level} xp={xp} xpToNext={xpToNext} popups={popups} />
             </div>
             <nav className="rounded-2xl p-2 bg-white/[0.03] border border-white/10 flex flex-col gap-1">
-              {visibleNav.map((n) => {
+              {desktopNav.map((n) => {
                 const Icon = n.icon;
                 const active = tab === n.id;
                 return (
                   <button
                     key={n.id}
-                    onClick={() => setTab(n.id)}
+                    onClick={() => setTab(n.id as TabId)}
                     className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition ${
                       active ? "bg-cyan-500/15 text-cyan-200 shadow-[inset_0_0_15px_rgba(6,182,212,0.2)]" : "text-white/60 hover:bg-white/5"
                     }`}
@@ -882,8 +966,9 @@ function Modelzon() {
                       ref={studioRef}
                       garment={garment} color={color} quality={quality}
                       brush={brush}
-                      decalUrl={decalUrl} decalTransform={decalTransform}
-                      decalUrlBack={decalUrlBack} decalTransformBack={decalTransformBack}
+                      decalUrl={null}
+                      overlayFrontUrl={overlayFront}
+                      overlayBackUrl={overlayBack}
                       modelPath={modelPath} size={size}
                       fabricType={fabricType}
                       background={studioBg} pose={pose}
@@ -932,6 +1017,7 @@ function Modelzon() {
                     ["garments", t("Garments", "ملابس"), Shirt],
                     ["fit", t("Color", "اللون"), PaletteIcon],
                     ["paint", t("Paint", "رسم"), Brush],
+                    ["print", t("Print", "طباعة"), Printer],
                     ["bg", t("Background", "الخلفية"), ImageIcon],
                     ["layout", t("Mockups", "الموك اب"), LayoutGrid],
                     ["artwork", t("Edit", "تحرير"), Sticker],
@@ -979,11 +1065,72 @@ function Modelzon() {
                     palette={PALETTE}
                     frozen={frozen}
                     setFrozen={setFrozen}
-                    onUploadImage={handleUploadImage}
                     onUndo={() => setUndoSignal((n) => n + 1)}
-                    onClear={() => setClearSignal((n) => n + 1)}
                     lang={lang}
                   />
+                )}
+
+                {/* §8 Print tab — the production actions that used to live in
+                    the paint toolbar: upload artwork, undo the last paint
+                    stroke, clear painted layers, plus element-level undo.
+                    Print/embroidery treatment stays in the Edit tab. */}
+                {studioPanel === "print" && (
+                  <div className="rounded-2xl p-3 bg-white/[0.03] border border-white/10 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Printer size={15} className="text-cyan-300" />
+                      <span className="text-sm font-black">{t("Print shop", "قسم الطباعة")}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => artworkFileRef.current?.click()}
+                        className="flex flex-col items-center gap-1 py-3 rounded-xl bg-cyan-400/10 border border-cyan-400/30 text-cyan-100 text-[10px] font-bold hover:bg-cyan-400/20 transition"
+                      >
+                        <Upload size={16} />
+                        {t("Upload artwork", "رفع صورة")}
+                      </button>
+                      <button
+                        onClick={() => setElements((els) => els.slice(0, -1))}
+                        disabled={elements.length === 0}
+                        className="flex flex-col items-center gap-1 py-3 rounded-xl bg-white/[0.04] border border-white/10 text-white/70 text-[10px] font-bold hover:bg-white/[0.08] disabled:opacity-30 transition"
+                      >
+                        <Trash2 size={16} />
+                        {t("Delete last element", "حذف آخر عنصر")}
+                      </button>
+                      <button
+                        onClick={() => setUndoSignal((n) => n + 1)}
+                        className="flex flex-col items-center gap-1 py-3 rounded-xl bg-white/[0.04] border border-white/10 text-white/70 text-[10px] font-bold hover:bg-white/[0.08] transition"
+                      >
+                        <RotateCw size={16} />
+                        {t("Undo paint stroke", "تراجع عن رسمة")}
+                      </button>
+                      <button
+                        onClick={() => setClearSignal((n) => n + 1)}
+                        className="flex flex-col items-center gap-1 py-3 rounded-xl bg-red-500/10 border border-red-400/30 text-red-200 text-[10px] font-bold hover:bg-red-500/20 transition"
+                      >
+                        <X size={16} />
+                        {t("Clear painted layer", "مسح الرسم اليدوي")}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-white/40 leading-relaxed">
+                      {t(
+                        "Undo/clear apply to the freehand painted layer. Elements (images & text) are managed per-piece from the Edit tab or by tapping them on the mockup.",
+                        "التراجع/المسح يخصّان طبقة الرسم اليدوي فقط. العناصر (صور ونصوص) تُدار من تبويب تحرير أو بالضغط عليها في الموك اب.",
+                      )}
+                    </p>
+                    {elements.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {elements.map((el) => (
+                          <button
+                            key={el.id}
+                            onClick={() => setElements((els) => els.filter((x) => x.id !== el.id))}
+                            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-white/[0.04] border border-white/10 text-white/60 text-[9px] font-bold hover:border-red-400/50 hover:text-red-200"
+                          >
+                            {el.kind === "text" ? `✕ ${(el.text ?? "").slice(0, 10)}` : "✕ " + t("artwork", "رسمة")}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
 
                 {/* Background + motion (animation) properties */}
@@ -1040,23 +1187,32 @@ function Modelzon() {
                 )}
 
                 {/* 2D Mockup board — the four mockup squares (front / back /
-                    sleeves), now real smooth direct-manipulation controls:
-                    drag, resize and rotate artwork right on the mockup. The
-                    purple button opens the full garment-parts picker, and
-                    anything added lands here AND on the 3D garment above
-                    (front/back) automatically. */}
+                    sleeves). Tapping a square expands it into the full
+                    Design-Layout-style editor: free drag, 4-corner free
+                    resize, rotate handle, opacity + fabric-UV sliders,
+                    lock/delete, text tool and direct painting — all synced
+                    live to the 3D garment above. */}
                 {studioPanel === "layout" && (
                   <MockupBoard2D
                     garment={garment}
                     color={color}
                     ar={lang === "ar"}
-                    side={decalSide}
-                    onSide={setDecalSide}
-                    slots={mockupSlots}
-                    onTransform={setMockupTransform}
-                    onRemove={removeMockupArtwork}
-                    onUpload={applyArtworkToSide}
+                    elements={elements}
+                    onPatchElement={(id, patch) => setElements((els) => els.map((e) => (e.id === id ? { ...e, ...patch } : e)))}
+                    onRemoveElement={(id) => setElements((els) => els.filter((e) => e.id !== id))}
+                    onReplaceElement={(el) => setElements((els) => els.map((e) => (e.id === el.id ? el : e)))}
+                    onAddElement={(el) => setElements((els) => [...els, el])}
+                    onAddImage={addElementToPanel}
+                    activePanel={decalSide}
+                    onActivePanel={setDecalSide}
                     onOpenParts={() => setPartsSheetOpen(true)}
+                    brushColor={brush.color}
+                    onBrushColor={(c) => setBrush((b) => ({ ...b, color: c }))}
+                    brushSize={brush.size}
+                    onBrushSize={(n) => setBrush((b) => ({ ...b, size: n }))}
+                    onPaint={handleMockupPaint}
+                    onPaintUndo={() => setUndoSignal((n) => n + 1)}
+                    onPaintClear={() => setClearSignal((n) => n + 1)}
                   />
                 )}
 
@@ -1066,7 +1222,7 @@ function Modelzon() {
                   <AIGraphicAssistant
                     userId={user.id}
                     lang={lang}
-                    onGenerated={(url) => { applyArtworkToSide(url); void refreshMissions(); }}
+                    onGenerated={(url) => { addElementToPanel(decalSide === "back" ? "back" : "front", url); void refreshMissions(); }}
                   />
                 )}
 
@@ -1130,40 +1286,59 @@ function Modelzon() {
                     ))}
                   </div>
 
-                  {/* The old drag-pad ("تحكم مكان الصورة") is gone — placement
-                      is direct manipulation on the 2D mockup board now
-                      (Mockups tab). This panel just uploads / removes the
-                      artwork of the selected side. */}
+                  {/* Placement is direct manipulation on the 2D mockup board
+                      (Mockups tab) — this panel manages WHICH elements live
+                      on each side: upload, inspect and delete them. */}
                   {(() => {
                     const onBack = decalSide === "back";
-                    const url = onBack ? decalUrlBack : decalUrl;
-                    return url ? (
-                      <div className="flex items-center gap-2 rounded-xl bg-black/40 border border-white/10 p-2">
-                        <div className="w-10 h-10 rounded-lg bg-white/5 border border-white/10 overflow-hidden shrink-0 flex items-center justify-center">
-                          <img src={url} alt="" className="w-full h-full object-contain" />
-                        </div>
-                        <span className="flex-1 text-[10px] text-white/50 leading-tight">
-                          {t("Position it by dragging directly on the mockup (Mockups tab).", "حرّك مكان الرسمة بالسحب المباشر على الموك اب (تبويب الموك اب).")}
-                        </span>
+                    const sideEls = elements.filter((e) => e.panel === decalSide);
+                    return (
+                      <>
                         <button
-                          onClick={() => { onBack ? setDecalUrlBack(null) : setDecalUrl(null); }}
-                          className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-red-500/15 border border-red-400/40 text-red-200 text-[10px] font-bold"
+                          onClick={() => artworkFileRef.current?.click()}
+                          className="w-full flex flex-col items-center justify-center gap-1.5 py-4 rounded-xl border-2 border-dashed border-white/15 text-white/40 hover:border-cyan-400/40 hover:text-cyan-300 transition"
                         >
-                          <Trash2 size={12} /> {t("Remove", "حذف")}
+                          <Upload size={20} />
+                          <span className="text-[11px]">
+                            {onBack
+                              ? t("Upload artwork for the back — it prints on the back only.", "ارفع صورة للخلف — بتُطبع بالخلف بس.")
+                              : t("Upload artwork for this panel, or generate one with AI.", "ارفع صورة لهذا الجزء، أو ولّدها بالذكاء الاصطناعي.")}
+                          </span>
                         </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={() => artworkFileRef.current?.click()}
-                        className="w-full flex flex-col items-center justify-center gap-1.5 py-4 rounded-xl border-2 border-dashed border-white/15 text-white/40 hover:border-cyan-400/40 hover:text-cyan-300 transition"
-                      >
-                        <Upload size={20} />
-                        <span className="text-[11px]">
-                          {onBack
-                            ? t("Upload artwork for the back — it prints on the back only.", "ارفع صورة للخلف — بتُطبع بالخلف بس.")
-                            : t("Upload artwork for the front, or generate one with AI.", "ارفع صورة للأمام، أو ولّدها بالذكاء الاصطناعي.")}
-                        </span>
-                      </button>
+                        {sideEls.length > 0 && (
+                          <div className="space-y-1.5">
+                            <div className="text-[10px] uppercase tracking-widest text-white/40">
+                              {t("Elements on this panel", "العناصر على هذا الجزء")} ({sideEls.length})
+                            </div>
+                            {sideEls.map((el) => (
+                              <div key={el.id} className="flex items-center gap-2 rounded-xl bg-black/40 border border-white/10 p-1.5">
+                                <div className="w-9 h-9 rounded-lg bg-white/5 border border-white/10 overflow-hidden shrink-0 flex items-center justify-center">
+                                  {el.kind === "image" && el.src
+                                    ? <img src={el.src} alt="" className="w-full h-full object-contain" />
+                                    : <span className="text-[10px] font-black" style={{ color: el.color }}>T</span>}
+                                </div>
+                                <span className="flex-1 text-[10px] text-white/60 truncate">
+                                  {el.kind === "text" ? el.text : t("Artwork", "رسمة")}
+                                  {el.locked ? " 🔒" : ""}
+                                </span>
+                                <button
+                                  onClick={() => { setDecalSide(el.panel); setStudioPanel("layout"); }}
+                                  className="px-2 py-1 rounded-lg bg-white/5 border border-white/10 text-white/60 text-[9px] font-bold"
+                                >
+                                  {t("تحرير بالموك اب", "Edit in Mockups")}
+                                </button>
+                                <button
+                                  onClick={() => setElements((els) => els.filter((x) => x.id !== el.id))}
+                                  disabled={el.locked}
+                                  className="w-7 h-7 rounded-lg flex items-center justify-center bg-red-500/15 border border-red-400/40 text-red-200 disabled:opacity-30"
+                                >
+                                  <Trash2 size={12} />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </>
                     );
                   })()}
                   <input
@@ -1175,7 +1350,13 @@ function Modelzon() {
                       const f = e.target.files?.[0];
                       if (f) {
                         const reader = new FileReader();
-                        reader.onload = () => applyArtworkToSide(String(reader.result));
+                        reader.onload = () => {
+                          const url = String(reader.result);
+                          const probe = new Image();
+                          probe.onload = () => addElementToPanel(decalSide, url, probe.naturalWidth / Math.max(1, probe.naturalHeight));
+                          probe.onerror = () => addElementToPanel(decalSide, url, 1);
+                          probe.src = url;
+                        };
                         reader.readAsDataURL(f);
                       }
                       e.currentTarget.value = "";
@@ -1224,7 +1405,7 @@ function Modelzon() {
                     garment={garment}
                     color={color}
                     decalUrl={decalUrl}
-                    decalTransform={decalTransform}
+                    decalTransform={DEFAULT_DECAL_TRANSFORM}
                     onEnterStudio={() => setTab("studio")}
                     onClose={() => { setBattleActive(false); void refreshMissions(); refreshProfile(); }}
                   />
@@ -1385,51 +1566,119 @@ function Modelzon() {
                         <DialogHeader>
                           <DialogTitle className="sr-only">{viewingPlayer.username}</DialogTitle>
                         </DialogHeader>
-                        <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] items-start py-1">
-                          {/* published designs + bio in the empty space */}
-                          <div className="min-w-0 order-2 sm:order-1">
-                            {viewedPrivate ? (
-                              <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-center">
-                                <Shield size={18} className="mx-auto text-white/30" />
-                                <p className="mt-2 text-[11px] text-white/40">
-                                  {t("This profile is private — designs are hidden.", "هذا الحساب خاص — التصاميم مخفية.")}
-                                </p>
-                              </div>
-                            ) : (
-                              <>
-                                <div className="text-[10px] uppercase tracking-widest text-white/40 mb-2">
-                                  {t("Published designs", "التصاميم المنشورة")}
-                                </div>
-                                {viewedDesigns.length === 0 ? (
-                                  <p className="text-[11px] text-white/30">{t("No designs published yet.", "ما نشر أي تصميم بعد.")}</p>
-                                ) : (
-                                  <div className="grid grid-cols-3 gap-2">
-                                    {viewedDesigns.slice(0, 9).map((d) => (
-                                      <div key={d.id} className="aspect-square rounded-lg overflow-hidden border border-white/10" style={{ background: d.color }}>
-                                        {d.decal_url && <img src={d.decal_url} alt={d.title} className="w-full h-full object-contain" />}
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-                              </>
+                        <div className="space-y-3 py-1">
+                          {/* §9 — one horizontal header strip: identity pinned
+                              to the FAR EDGE (left in RTL) with the content
+                              toggles (designs/videos) and the add-friend "+"
+                              beside it, then the content below. */}
+                          <div className="flex items-center gap-2 flex-wrap">
+                            {/* designs / videos toggles (dimmed if empty) */}
+                            <button
+                              onClick={() => setViewedSection("designs")}
+                              className={`relative w-10 h-10 rounded-xl border flex items-center justify-center transition ${
+                                viewedSection === "designs" ? "bg-cyan-400/20 border-cyan-400/60 text-cyan-100" : "bg-white/[0.04] border-white/10 text-white/50"
+                              } ${viewedDesigns.length === 0 ? "opacity-30 pointer-events-none" : ""}`}
+                              title={t("Designs", "التصاميم")}
+                            >
+                              <Sticker size={17} />
+                              {viewedDesigns.length > 0 && (
+                                <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-cyan-400 text-black text-[9px] font-black grid place-items-center">{viewedDesigns.length}</span>
+                              )}
+                            </button>
+                            <button
+                              onClick={() => setViewedSection("videos")}
+                              className={`relative w-10 h-10 rounded-xl border flex items-center justify-center transition ${
+                                viewedSection === "videos" ? "bg-fuchsia-400/20 border-fuchsia-400/60 text-fuchsia-100" : "bg-white/[0.04] border-white/10 text-white/50"
+                              } ${viewedShorts.length === 0 ? "opacity-30 pointer-events-none" : ""}`}
+                              title={t("Videos", "الفيديوهات")}
+                            >
+                              <Clapperboard size={17} />
+                              {viewedShorts.length > 0 && (
+                                <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-fuchsia-400 text-black text-[9px] font-black grid place-items-center">{viewedShorts.length}</span>
+                              )}
+                            </button>
+
+                            {/* add-friend "+" (§9b): plain +, hourglass while the
+                                request is pending, check once friends. */}
+                            {viewingPlayer.id !== user?.id && (
+                              <button
+                                onClick={() => handleSendFriendRequest(viewingPlayer.id)}
+                                disabled={friendReqState === "sending" || friendReqState === "pending" || friendReqState === "friends"}
+                                title={
+                                  friendReqState === "pending" ? t("Request pending — expires after 30 days", "الطلب معلّق — ينتهي بعد 30 يوم")
+                                  : friendReqState === "friends" ? t("Already friends", "أصدقاء بالفعل")
+                                  : t("Send friend request", "إرسال طلب صداقة")
+                                }
+                                className={`w-10 h-10 rounded-xl border flex items-center justify-center transition ${
+                                  friendReqState === "friends"
+                                    ? "bg-emerald-400/20 border-emerald-400/60 text-emerald-200"
+                                    : friendReqState === "pending"
+                                      ? "bg-amber-400/20 border-amber-400/60 text-amber-200"
+                                      : "bg-gradient-to-br from-cyan-400 to-fuchsia-500 border-transparent text-black hover:brightness-110 active:scale-95"
+                                }`}
+                              >
+                                {friendReqState === "friends" ? <Check size={17} />
+                                  : friendReqState === "pending" ? <Hourglass size={17} />
+                                  : friendReqState === "sending" ? <Hourglass size={17} className="animate-pulse" />
+                                  : <UserPlus size={17} />}
+                              </button>
                             )}
-                            <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.02] p-3">
-                              <div className="text-[10px] uppercase tracking-widest text-white/40 mb-1">{t("Bio", "النبذة")}</div>
-                              <p className="text-[12px] text-white/70 break-words">
-                                {viewedBio || t("No bio yet.", "ما فيه نبذة بعد.")}
-                              </p>
+
+                            {/* identity — pinned to the far edge (LEFT in RTL)
+                                via margin-inline-start:auto. */}
+                            <div className="ms-auto flex items-center gap-2.5 rounded-2xl border border-white/10 bg-gradient-to-br from-cyan-500/10 to-fuchsia-500/10 pl-2.5 pr-3 py-1.5 min-w-0">
+                              <div className="w-11 h-11 rounded-xl overflow-hidden bg-gradient-to-br from-cyan-400 to-fuchsia-500 flex items-center justify-center text-black font-black text-xl shrink-0">
+                                {viewedAvatar ? <img src={viewedAvatar} alt="" onError={() => setViewedAvatar(null)} className="w-full h-full object-cover" /> : viewingPlayer.username[0]?.toUpperCase()}
+                              </div>
+                              <div className="min-w-0 text-start">
+                                <div className="font-black text-sm truncate">{viewingPlayer.username}</div>
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <RankBadge level={viewingPlayer.level} lang={lang} size={11} />
+                                  <span className="text-[10px] text-white/40 font-mono">LVL {viewingPlayer.level} · {viewingPlayer.xp} XP</span>
+                                </div>
+                              </div>
                             </div>
                           </div>
 
-                          {/* identity card, pushed to the trailing edge */}
-                          <div className="order-1 sm:order-2 flex flex-col items-center text-center shrink-0 w-full sm:w-36 rounded-2xl border border-white/10 bg-gradient-to-br from-cyan-500/10 to-fuchsia-500/10 p-3">
-                            <div className="w-16 h-16 rounded-2xl overflow-hidden bg-gradient-to-br from-cyan-400 to-fuchsia-500 flex items-center justify-center text-black font-black text-2xl mb-2">
-                              {viewedAvatar ? <img src={viewedAvatar} alt="" onError={() => setViewedAvatar(null)} className="w-full h-full object-cover" /> : viewingPlayer.username[0]?.toUpperCase()}
-                            </div>
-                            <div className="font-black text-sm break-words">{viewingPlayer.username}</div>
-                            <RankBadge level={viewingPlayer.level} lang={lang} size={14} />
-                            <div className="text-[11px] text-white/40 mt-1">LVL {viewingPlayer.level} · {viewingPlayer.xp} XP</div>
+                          {/* bio strip */}
+                          <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2">
+                            <div className="text-[10px] uppercase tracking-widest text-white/40 mb-0.5">{t("Bio", "النبذة")}</div>
+                            <p className="text-[12px] text-white/70 break-words">
+                              {viewedBio || t("No bio yet.", "ما فيه نبذة بعد.")}
+                            </p>
                           </div>
+
+                          {/* content: designs or videos */}
+                          {viewedPrivate ? (
+                            <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 text-center">
+                              <Shield size={18} className="mx-auto text-white/30" />
+                              <p className="mt-2 text-[11px] text-white/40">
+                                {t("This profile is private — designs are hidden.", "هذا الحساب خاص — التصاميم مخفية.")}
+                              </p>
+                            </div>
+                          ) : viewedSection === "videos" ? (
+                            viewedShorts.length === 0 ? (
+                              <p className="text-[11px] text-white/30 text-center py-3">{t("No videos yet.", "ما فيه فيديوهات بعد.")}</p>
+                            ) : (
+                              <div className="grid grid-cols-3 gap-2">
+                                {viewedShorts.map((v) => (
+                                  <div key={v.id} className="aspect-[9/16] rounded-lg overflow-hidden border border-white/10 bg-black">
+                                    <video src={v.video_url} muted playsInline preload="metadata" className="w-full h-full object-cover" />
+                                  </div>
+                                ))}
+                              </div>
+                            )
+                          ) : viewedDesigns.length === 0 ? (
+                            <p className="text-[11px] text-white/30 text-center py-3">{t("No designs published yet.", "ما نشر أي تصميم بعد.")}</p>
+                          ) : (
+                            <div className="grid grid-cols-3 gap-2">
+                              {viewedDesigns.slice(0, 9).map((d) => (
+                                <div key={d.id} className="aspect-square rounded-lg overflow-hidden border border-white/10" style={{ background: d.color }}>
+                                  {d.decal_url && <img src={d.decal_url} alt={d.title} className="w-full h-full object-contain" />}
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       </>
                     )}
@@ -1867,6 +2116,39 @@ function Modelzon() {
                     <span className="text-[10px] text-white/40">{friends.length}/{FRIEND_LIMIT[profile?.subscription_tier ?? "free"] ?? 0}</span>
                   </div>
 
+                  {/* §9b — incoming friend requests (pending, 30-day expiry).
+                      Accept → mutual friendship rows; decline → closed. */}
+                  {friendRequests.length > 0 && (
+                    <div className="mb-3 rounded-xl border border-amber-400/30 bg-amber-400/[0.06] p-2.5 space-y-1.5">
+                      <div className="text-[10px] uppercase tracking-widest text-amber-200/80">
+                        {t("Friend requests", "طلبات الصداقة")} ({friendRequests.length})
+                      </div>
+                      {friendRequests.map((r) => (
+                        <div key={r.id} className="flex items-center gap-2 rounded-lg bg-black/30 px-2 py-1.5">
+                          <div className="w-7 h-7 rounded-full bg-gradient-to-br from-cyan-400 to-fuchsia-500 flex items-center justify-center text-[10px] font-black text-black overflow-hidden shrink-0">
+                            {r.avatarUrl ? <img src={r.avatarUrl} className="w-full h-full object-cover" /> : r.username[0]?.toUpperCase()}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-xs font-bold truncate">{r.username}</div>
+                            <div className="text-[9px] text-white/35">LVL {r.level}</div>
+                          </div>
+                          <button
+                            onClick={() => handleRespondRequest(r.id, true)}
+                            className="px-2.5 py-1 rounded-lg bg-emerald-500/20 border border-emerald-400/40 text-emerald-200 text-[10px] font-black"
+                          >
+                            {t("Accept", "قبول")}
+                          </button>
+                          <button
+                            onClick={() => handleRespondRequest(r.id, false)}
+                            className="px-2.5 py-1 rounded-lg bg-white/5 border border-white/10 text-white/50 text-[10px] font-black"
+                          >
+                            {t("Decline", "رفض")}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {(FRIEND_LIMIT[profile?.subscription_tier ?? "free"] ?? 0) === 0 ? (
                     <p className="text-[11px] text-white/40">
                       {t("Subscribe to Pro or Elite to unlock a friends list.", "اشترك ببرو أو إيليت عشان تفتح قائمة الأصدقاء.")}
@@ -1923,6 +2205,13 @@ function Modelzon() {
                     visualizer={visualizer} setVisualizer={setVisualizer}
                     currency={currency} setCurrency={setCurrency}
                   />
+
+                  {/* Bring-your-own-key providers (§3): AI image generation +
+                      print supplier lookups run through the user's own
+                      accounts when keys are set. */}
+                  <div className="mt-4">
+                    <ApiKeysPanel lang={lang} />
+                  </div>
                   <p className="mt-1 text-[10px] text-white/40">
                     {privacy
                       ? t("Privacy ON — visitors only see your name, level and bio.", "الخصوصية مفعّلة — الزوار يشوفون الاسم والمستوى والنبذة فقط.")
@@ -1980,7 +2269,7 @@ function Modelzon() {
 
           <aside className="hidden lg:flex flex-col gap-4 overflow-hidden">
             <div className="flex-1 min-h-0 rounded-2xl bg-white/[0.03] border border-white/10 overflow-hidden">
-              <AIDesignChat onApply={aiApply} lang={lang} />
+              <AIDesignChat onApplyDesign={aiApplyDesign} lang={lang} />
             </div>
             <div className="rounded-2xl bg-white/[0.03] border border-white/10 overflow-hidden flex flex-col max-h-[40%]">
               <div className="p-3 border-b border-white/10 flex items-center gap-2">
@@ -2014,19 +2303,36 @@ function Modelzon() {
                 <button onClick={() => setAiOpen(false)}><X size={20} /></button>
               </div>
               <div className="flex-1 min-h-0">
-                <AIDesignChat onApply={aiApply} lang={lang} />
+                <AIDesignChat onApplyDesign={aiApplyDesign} lang={lang} />
               </div>
             </motion.div>
           </>
         )}
       </AnimatePresence>
 
-      <nav className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-black/90 backdrop-blur-xl border-t border-white/10 px-1 py-2 flex overflow-x-auto">
-        {visibleNav.map((n) => {
+      <nav className="lg:hidden fixed bottom-0 inset-x-0 z-40 bg-black/90 backdrop-blur-xl border-t border-white/10 px-1 py-2 flex overflow-x-auto items-center">
+        {bottomNav.map((n) => {
           const Icon = n.icon;
           const active = tab === n.id;
+          // §2 — the "+" action button: raised gradient circle, dead center
+          // of the bar. Opens the shared video-upload picker, never changes
+          // the active tab itself.
+          if (n.id === "upload") {
+            return (
+              <button
+                key={n.id}
+                onClick={() => setNavUploadOpen(true)}
+                title={t(n.en, n.ar)}
+                className="flex-1 min-w-[54px] flex flex-col items-center gap-0.5 py-1"
+              >
+                <span className="w-11 h-11 -mt-3 rounded-2xl bg-gradient-to-br from-cyan-400 to-fuchsia-500 text-black flex items-center justify-center shadow-[0_0_20px_rgba(6,182,212,0.45)] border-2 border-black/40 active:scale-95 transition">
+                  <Plus size={22} strokeWidth={3} />
+                </span>
+              </button>
+            );
+          }
           return (
-            <button key={n.id} onClick={() => setTab(n.id)}
+            <button key={n.id} onClick={() => setTab(n.id as TabId)}
               className={`flex-1 min-w-[54px] flex flex-col items-center gap-0.5 py-1 rounded-lg transition ${active ? "text-cyan-300" : "text-white/50"}`}>
               <Icon size={17} className={active ? "drop-shadow-[0_0_6px_currentColor]" : ""} />
               <span className="text-[9px] font-bold">{t(n.en, n.ar)}</span>
@@ -2034,6 +2340,31 @@ function Modelzon() {
           );
         })}
       </nav>
+
+      {/* §2 — shared video-upload flow behind the bottom-bar "+" (same
+          components the Reels tab uses). After posting, jumps to Reels. */}
+      {user && (
+        <>
+          <VideoUploadPicker
+            lang={lang}
+            open={navUploadOpen}
+            onClose={() => setNavUploadOpen(false)}
+            onFile={(f) => { setNavUploadFile(f); setNavUploadOpen(false); }}
+          />
+          <VideoUploadDialog
+            lang={lang}
+            userId={user.id}
+            username={profile?.username ?? "player"}
+            initialFile={navUploadFile}
+            onClose={() => { setNavUploadFile(null); }}
+            onDone={() => {
+              setNavUploadFile(null);
+              setTab("feed");
+              toast(lang === "ar" ? "انطلق للريلز 🎬" : "Jumping to Reels 🎬");
+            }}
+          />
+        </>
+      )}
 
       <div className="fixed top-20 right-4 z-50 space-y-1 pointer-events-none">
         <AnimatePresence>

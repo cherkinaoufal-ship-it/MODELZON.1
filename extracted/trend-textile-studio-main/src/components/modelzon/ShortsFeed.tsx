@@ -3,7 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import { Heart, MessageCircle, Share2, UploadCloud, Video, X, Loader2, Camera, Play, Volume2, VolumeX } from "lucide-react";
 
 import { useAuth } from "@/lib/auth";
-import { fetchShorts, uploadShort, toggleShortLike, fetchMyLikedShortIds, type ShortVideo } from "@/lib/shorts";
+import { fetchShorts, toggleShortLike, fetchMyLikedShortIds, type ShortVideo } from "@/lib/shorts";
+import { VideoUploadDialog } from "@/components/modelzon/VideoUpload";
 import { toast } from "sonner";
 
 /**
@@ -75,7 +76,7 @@ export default function ShortsFeed({ lang }: { lang: Lang }) {
 
 
       {uploadOpen && user && (
-        <UploadDialog
+        <VideoUploadDialog
           lang={lang}
           userId={user.id}
           username={profile?.username || "Player"}
@@ -97,7 +98,7 @@ export default function ShortsFeed({ lang }: { lang: Lang }) {
             className="flex items-center gap-1.5 px-3.5 py-2 rounded-full text-[11px] font-black text-white/85 hover:text-white hover:bg-white/10 transition"
           >
             <Camera size={16} />
-            <span className="hidden xs:inline sm:inline">{t("تصوير", "Record")}</span>
+            <span className="hidden xs:inline sm:inline">{t("Record", "تصوير")}</span>
           </button>
           <span className="w-px h-6 bg-white/15" />
           <button
@@ -105,7 +106,7 @@ export default function ShortsFeed({ lang }: { lang: Lang }) {
             className="flex items-center gap-1.5 px-4 py-2 rounded-full text-[11px] font-black text-black bg-gradient-to-r from-cyan-400 to-fuchsia-500 hover:brightness-110 active:scale-95 transition"
           >
             <UploadCloud size={16} />
-            {t("رفع فيديو", "Upload video")}
+            {t("Upload video", "رفع فيديو")}
           </button>
         </div>
       </div>
@@ -113,90 +114,6 @@ export default function ShortsFeed({ lang }: { lang: Lang }) {
   );
 }
 
-function UploadDialog({ lang, userId, username, initialFile, onClose, onDone }: { lang: Lang; userId: string; username: string; initialFile: File | null; onClose: () => void; onDone: () => void }) {
-  const t = (en: string, ar: string) => (lang === "ar" ? ar : en);
-  const [file, setFile] = useState<File | null>(initialFile);
-  const [caption, setCaption] = useState("");
-  const [progress, setProgress] = useState<number | null>(null);
-  const [busy, setBusy] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  // Bug fix: this used to call `URL.createObjectURL(file)` directly inside
-  // the JSX, which creates a BRAND NEW blob URL on every single re-render
-  // (including just typing in the caption box) — the <video> element kept
-  // getting handed a different src and restarting, which is exactly the
-  // "stuck spinning, never actually plays" glitch. Now the object URL is
-  // created exactly once per file (and cleaned up when it changes/unmounts).
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  useEffect(() => {
-    if (!file) { setPreviewUrl(null); return; }
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
-
-  const submit = async () => {
-    if (!file) return;
-    setBusy(true);
-    setProgress(0);
-    const result = await uploadShort({ userId, username, file, caption, garment: null, onProgress: setProgress });
-    setBusy(false);
-    if (result.ok) { toast.success(t("Video uploaded 🎬", "تم رفع الفيديو 🎬")); onDone(); }
-    else toast.error(result.message ?? t("Upload failed", "فشل الرفع"));
-  };
-
-  return (
-    <div className="fixed inset-0 z-[70] bg-black/85 backdrop-blur-md flex items-center justify-center p-4" onClick={(e) => e.target === e.currentTarget && !busy && onClose()}>
-      <div className="w-full max-w-sm rounded-2xl border border-cyan-400/30 bg-black p-5">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2 text-cyan-300 font-black text-sm"><Video size={16} /> {t("Upload video", "رفع فيديو")}</div>
-          {!busy && <button onClick={onClose}><X size={18} className="text-white/40" /></button>}
-        </div>
-
-        {!file ? (
-          <button
-            onClick={() => inputRef.current?.click()}
-            className="w-full aspect-video rounded-xl border-2 border-dashed border-white/15 flex flex-col items-center justify-center gap-2 text-white/40 hover:border-cyan-400/40 hover:text-cyan-300 transition"
-          >
-            <UploadCloud size={28} />
-            <span className="text-xs">{t("Tap to choose any video — no size limit", "اضغط لاختيار أي فيديو — بدون حد للحجم")}</span>
-          </button>
-        ) : (
-          <div className="rounded-xl overflow-hidden bg-black border border-white/10">
-            {previewUrl && <video src={previewUrl} controls playsInline className="w-full max-h-56" />}
-          </div>
-        )}
-        <input ref={inputRef} type="file" accept="video/*" className="hidden" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-
-        <textarea
-          value={caption}
-          onChange={(e) => setCaption(e.target.value)}
-          placeholder={t("Caption (optional)", "وصف (اختياري)")}
-          rows={2}
-          className="w-full mt-3 bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-xs outline-none focus:border-cyan-400/50 resize-none"
-        />
-
-        {progress !== null && (
-          <div className="mt-3 h-1.5 rounded-full bg-white/10 overflow-hidden">
-            <div className="h-full bg-cyan-400 transition-all" style={{ width: `${progress}%` }} />
-          </div>
-        )}
-
-        <button
-          onClick={submit}
-          disabled={!file || busy}
-          className="mt-3 w-full py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 text-black font-black text-sm disabled:opacity-40 flex items-center justify-center gap-2"
-        >
-          {busy ? <Loader2 size={14} className="animate-spin" /> : <UploadCloud size={14} />}
-          {busy ? `${progress ?? 0}%` : t("Post", "نشر")}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/** One full-viewport reel page: autoplays while it's the visible page,
- *  pauses when scrolled away, tap anywhere to pause/resume. */
 function ReelPage({ short, lang, isLiked, onLike }: { short: ShortVideo; lang: Lang; isLiked: boolean; onLike: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [paused, setPaused] = useState(false);

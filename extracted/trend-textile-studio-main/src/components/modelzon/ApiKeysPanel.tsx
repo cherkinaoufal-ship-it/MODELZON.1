@@ -11,6 +11,8 @@ const STORAGE = "modelzon_api_keys_v1";
 export default function ApiKeysPanel({ lang }: Props) {
   const t = (en: string, ar: string) => (lang === "ar" ? ar : en);
   const [aiKey, setAiKey] = useState("");
+  const [aiBaseUrl, setAiBaseUrl] = useState("https://api.openai.com/v1");
+  const [aiModel, setAiModel] = useState("gpt-image-1");
   const [supplierKey, setSupplierKey] = useState("");
   const [supplierUrl, setSupplierUrl] = useState("");
   const [showAi, setShowAi] = useState(false);
@@ -23,6 +25,8 @@ export default function ApiKeysPanel({ lang }: Props) {
       if (raw) {
         const j = JSON.parse(raw);
         setAiKey(j.aiKey ?? "");
+        setAiBaseUrl(j.aiBaseUrl ?? "https://api.openai.com/v1");
+        setAiModel(j.aiModel ?? "gpt-image-1");
         setSupplierKey(j.supplierKey ?? "");
         setSupplierUrl(j.supplierUrl ?? "");
       }
@@ -30,7 +34,7 @@ export default function ApiKeysPanel({ lang }: Props) {
   }, []);
 
   const save = () => {
-    localStorage.setItem(STORAGE, JSON.stringify({ aiKey, supplierKey, supplierUrl }));
+    localStorage.setItem(STORAGE, JSON.stringify({ aiKey, aiBaseUrl, aiModel, supplierKey, supplierUrl }));
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
   };
@@ -88,8 +92,32 @@ export default function ApiKeysPanel({ lang }: Props) {
         setAiKey,
         showAi,
         setShowAi,
-        "sk-... (OpenAI / Anthropic / etc.)",
+        "sk-... (OpenAI / any OpenAI-compatible image API)",
       )}
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-1.5">
+          <label className="flex items-center gap-2 text-xs font-bold text-white/70">
+            <Bot size={13} /> {t("Base URL", "رابط الـ API")}
+          </label>
+          <input
+            value={aiBaseUrl}
+            onChange={(e) => setAiBaseUrl(e.target.value)}
+            placeholder="https://api.openai.com/v1"
+            className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:border-cyan-400/60 placeholder:text-white/25"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <label className="flex items-center gap-2 text-xs font-bold text-white/70">
+            <Bot size={13} /> {t("Image model", "موديل الصور")}
+          </label>
+          <input
+            value={aiModel}
+            onChange={(e) => setAiModel(e.target.value)}
+            placeholder="gpt-image-1"
+            className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:border-cyan-400/60 placeholder:text-white/25"
+          />
+        </div>
+      </div>
       {field(
         Truck,
         t("Supplier API Key", "مفتاح المورد"),

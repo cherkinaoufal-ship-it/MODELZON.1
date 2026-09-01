@@ -2,7 +2,7 @@ import type { Lang } from "@/lib/i18n";
 import { useRef, useState } from "react";
 import {
   Brush, Eraser, Droplet, Type as TypeIcon, Waves, Blend,
-  Upload, Undo2, Trash2, FlipHorizontal2, Snowflake, Sun, ChevronDown,
+  Undo2, FlipHorizontal2, Snowflake, Sun, ChevronDown,
 } from "lucide-react";
 import ColorPickerHSV from "@/components/modelzon/ColorPickerHSV";
 import BrushPreview from "@/components/modelzon/BrushPreview";
@@ -18,9 +18,9 @@ interface Props {
   palette: string[];
   frozen: boolean;
   setFrozen: (v: boolean) => void;
-  onUploadImage: (dataUrl: string) => void;
+  /** Quick stroke-undo stays one tap away while painting. Upload & clear
+   *  moved to the dedicated Print tab (§8). */
   onUndo: () => void;
-  onClear: () => void;
   lang: Lang;
 }
 
@@ -39,18 +39,10 @@ const TOOLS: { id: ToolId; icon: any; en: string; ar: string }[] = [
 ];
 
 export default function ProToolbar({
-  brush, setBrush, palette, frozen, setFrozen, onUploadImage, onUndo, onClear, lang,
+  brush, setBrush, palette, frozen, setFrozen, onUndo, lang,
 }: Props) {
   const t = (en: string, ar: string) => (lang === "ar" ? ar : en);
-  const fileRef = useRef<HTMLInputElement>(null);
   const [openGroup, setOpenGroup] = useState<string>("core");
-
-  const pickFile = (f: File | null) => {
-    if (!f) return;
-    const reader = new FileReader();
-    reader.onload = () => onUploadImage(String(reader.result));
-    reader.readAsDataURL(f);
-  };
 
   const activeBrushLabel = (() => {
     for (const g of BRUSH_GROUPS) {
@@ -67,13 +59,19 @@ export default function ProToolbar({
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[10px] uppercase tracking-widest text-white/50">{t("Tools", "الأدوات")}</span>
           <button
+            onClick={onUndo}
+            title={t("Undo stroke", "تراجع عن ضربة")}
+            className="ml-auto flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-black bg-white/5 border border-white/10 text-white/60 hover:border-cyan-400/40 transition"
+          >
+            <Undo2 size={12} /> {t("Undo", "تراجع")}
+          </button>
+          <button
             onClick={() => setFrozen(!frozen)}
             className={`ml-auto flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-black border transition ${
               frozen ? "bg-cyan-500/25 border-cyan-400 text-cyan-100" : "bg-white/5 border-white/10 text-white/60"
             }`}
           >
             {frozen ? <Snowflake size={12} /> : <Sun size={12} />}
-            {frozen ? t("Frozen", "مثبّت") : t("Spinning", "يدور")}
           </button>
         </div>
         <div className="grid grid-cols-6 gap-1.5">
@@ -221,6 +219,30 @@ export default function ProToolbar({
         ))}
       </div>
 
+      {/* Smudge controls (§6) — the reservoir smudge has its own strength
+          (how much pigment the sponge picks up & deposits) and size. */}
+      {brush.tool === "smudge" && (
+        <div className="p-3 border-b border-white/10 grid sm:grid-cols-2 gap-3 bg-fuchsia-500/[0.05]">
+          {[
+            { label: t("Smudge strength", "قوة التنعيم"), value: brush.smudgeStrength, min: 0.05, max: 1, step: 0.05, key: "smudgeStrength" as const, display: `${Math.round(brush.smudgeStrength * 100)}%` },
+            { label: t("Smudge size", "حجم التنعيم"), value: brush.smudgeSize, min: 10, max: 120, step: 1, key: "smudgeSize" as const, display: `${brush.smudgeSize}px` },
+          ].map((sl) => (
+            <div key={sl.key}>
+              <div className="flex items-center justify-between text-[10px] text-white/50 mb-1">
+                <span className="uppercase tracking-widest">{sl.label}</span>
+                <span className="font-mono text-fuchsia-200">{sl.display}</span>
+              </div>
+              <input
+                type="range"
+                min={sl.min} max={sl.max} step={sl.step} value={sl.value}
+                onChange={(e) => setBrush({ [sl.key]: Number(e.target.value) } as Partial<BrushSettings>)}
+                className="w-full accent-fuchsia-400"
+              />
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Typography */}
       {brush.tool === "text" && (
         <div className="p-3 border-b border-white/10 flex flex-col sm:flex-row gap-2">
@@ -258,34 +280,6 @@ export default function ProToolbar({
         </div>
       </div>
 
-      {/* Actions */}
-      <div className="p-3 flex flex-wrap gap-2">
-        <button
-          onClick={() => fileRef.current?.click()}
-          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-cyan-500/15 border border-cyan-400/40 text-cyan-200 text-xs font-bold"
-        >
-          <Upload size={13} /> {t("Upload artwork", "رفع صورة")}
-        </button>
-        <input
-          ref={fileRef}
-          type="file"
-          accept="image/*"
-          hidden
-          onChange={(e) => { pickFile(e.target.files?.[0] ?? null); e.currentTarget.value = ""; }}
-        />
-        <button
-          onClick={onUndo}
-          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white/70 text-xs font-bold"
-        >
-          <Undo2 size={13} /> {t("Undo", "تراجع")}
-        </button>
-        <button
-          onClick={onClear}
-          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-red-500/15 border border-red-400/40 text-red-200 text-xs font-bold"
-        >
-          <Trash2 size={13} /> {t("Clear paint", "مسح الرسم")}
-        </button>
-      </div>
     </div>
   );
 }

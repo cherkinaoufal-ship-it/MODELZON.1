@@ -1,53 +1,66 @@
 import type { Lang } from "@/lib/i18n";
 import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Bot, Send, Sparkles, Wand2, Loader2 } from "lucide-react";
+import { Bot, Loader2, RefreshCcw, Send, Sparkles, Wand2 } from "lucide-react";
 import { useServerFn } from "@tanstack/react-start";
-import { generateDesign, getChatQuota } from "@/lib/ai-design.functions";
+import { generateGraphic } from "@/lib/ai-graphic.functions";
+import {
+  aiErrorText, generateDesignImage, isVaguePrompt, suggestDesignIdeas, type DesignIdea,
+} from "@/lib/ai-image";
 import { useAuth } from "@/lib/auth";
-import type { GarmentType } from "@/components/Studio3D";
+
+/**
+ * AI Stylist chat (§3 of the overhaul brief) — actually generates printable
+ * designs now:
+ *  • any descriptive message (ar/en) → a real PNG via the AI image pipeline
+ *    (own provider key from Settings → API Keys, with the managed gateway
+ *    as fallback) with an internal quality prompt + one auto-regeneration;
+ *  • vague messages ("فاجئني — ما أعرف أرسم!") → 3 concrete design-idea
+ *    thumbnails to pick from instead of an error;
+ *  • failures show a friendly "تعذر إنشاء التصميم، حاول مجددًا" with a
+ *    retry button — never a raw "Not found";
+ *  • every result has "تطبيق على القطعة" which drops it straight onto the
+ *    mockup board's active panel (same handles as uploaded artwork).
+ */
 
 type Msg = {
   id: number;
   role: "user" | "assistant";
   content: string;
-  design?: { garment: string; color: string; accent: string; vibe: string } | null;
+  imageUrl?: string;
+  ideas?: DesignIdea[];
+  failed?: boolean;
+  /** the prompt to resend when tapping "إعادة المحاولة" */
+  retryPrompt?: string;
 };
 
 interface Props {
-  onApply: (garment: GarmentType, color: string) => void;
+  onApplyDesign: (imageUrl: string) => void;
   lang: Lang;
 }
 
 const SUGGESTIONS_EN = [
-  "Design a cyber-Tokyo neon hoodie",
-  "Y2K holographic tee for me",
+  "Design a cyber-Tokyo neon hoodie graphic",
+  "Golden Arabic calligraphy print",
   "Surprise me — I can't draw!",
 ];
 const SUGGESTIONS_AR = [
-  "صمم لي هودي نيون طوكيو",
-  "تيشيرت هولوغرافيك Y2K",
+  "صمم لي رسمة نيون طوكيو",
+  "خط عربي ذهبي للطباعة",
   "فاجئني — ما أعرف أرسم!",
 ];
 
-export default function AIDesignChat({ onApply, lang }: Props) {
+export default function AIDesignChat({ onApplyDesign, lang }: Props) {
   const t = (en: string, ar: string) => (lang === "ar" ? ar : en);
-  const call = useServerFn(generateDesign);
-  const quotaFn = useServerFn(getChatQuota);
+  const gatewayCall = useServerFn(generateGraphic);
   const { user } = useAuth();
-  const [quota, setQuota] = useState<{ remaining: number; max: number } | null>(null);
-
-  useEffect(() => {
-    if (!user) return;
-    quotaFn({ data: { userId: user.id } }).then(setQuota).catch(() => {});
-  }, [user, quotaFn]);
   const [messages, setMessages] = useState<Msg[]>([
     {
       id: 0,
       role: "assistant",
       content: t(
-        "Hey! I'm your MODELZON AI stylist. Tell me a vibe and I'll design a piece for you — even if you can't draw.",
-        "أهلاً! أنا مصممك الذكي في MODELZON. قل لي الأجواء وأصمم لك قطعة — حتى لو ما تعرف ترسم.",
+        "Hey! I'm your MODELZON AI designer. Describe anything — colors, style, vibe — and I'll create a print-ready graphic you can drop straight onto the garment.",
+        "أهلاً! أنا مصممك الذكي في MODELZON. اوصف أي شي — ألوان، ستايل، أجواء — وأصنع لك رسمة جاهزة للطباعة تحطها على القطعة مباشرة.",
       ),
     },
   ]);
@@ -60,48 +73,66 @@ export default function AIDesignChat({ onApply, lang }: Props) {
     scrollRef.current?.scrollTo({ top: 9e6, behavior: "smooth" });
   }, [messages, busy]);
 
+  const generate = async (rawPrompt: string) => {
+    if (!user || busy) return;
+    setBusy(true);
+    try {
+      const result = await generateDesignImage({
+        userId: user.id,
+        prompt: rawPrompt,
+        gatewayCall: gatewayCall as any,
+      });
+      setMessages((m) => [
+        ...m,
+        {
+          id: idRef.current++,
+          role: "assistant",
+          content: t("Design is ready ✨ apply it to the piece:", "تصميمك جاهز ✨ طبّقه على القطعة:"),
+          imageUrl: result.imageUrl,
+        },
+      ]);
+    } catch (e) {
+      setMessages((m) => [
+        ...m,
+        {
+          id: idRef.current++,
+          role: "assistant",
+          content: `${aiErrorText(e, lang === "ar" ? "ar" : "en")}\n${t(
+            "(Set your own provider key in Settings → API Keys for guaranteed generation.)",
+            "(حط مفتاح مزودك الخاص من الإعدادات ← مفاتيح API عشان توليد مضمون.)",
+          )}`,
+          failed: true,
+          retryPrompt: rawPrompt,
+        },
+      ]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const send = async (text: string) => {
     if (!text.trim() || busy) return;
     if (!user) {
       setMessages((m) => [...m, { id: idRef.current++, role: "assistant", content: t("Please sign in first.", "سجّل دخولك أولاً.") }]);
       return;
     }
-    const userMsg: Msg = { id: idRef.current++, role: "user", content: text };
-    const nextHistory = [...messages, userMsg];
-    setMessages(nextHistory);
+    setMessages((m) => [...m, { id: idRef.current++, role: "user", content: text }]);
     setInput("");
-    setBusy(true);
-    try {
-      const res = await call({
-        data: {
-          userId: user.id,
-          messages: nextHistory.map((m) => ({ role: m.role, content: m.content })),
-        },
-      });
-      const aMsg: Msg = {
-        id: idRef.current++,
-        role: "assistant",
-        content: res.reply || "…",
-        design: res.design,
-      };
-      setMessages((m) => [...m, aMsg]);
-      setQuota((q) => (q ? { ...q, remaining: Math.max(0, q.remaining - 1) } : q));
-    } catch (e: any) {
-      const raw: string = e?.message ?? "AI unavailable";
-      const friendly = raw.startsWith("RATE_LIMITED")
-        ? t("You're sending messages too fast — take a short break and try again.", "ترسل رسايل بسرعة كبيرة — استريح شوي وحاول مرة ثانية.")
-        : raw;
-      setMessages((m) => [...m, { id: idRef.current++, role: "assistant", content: `⚠ ${friendly}` }]);
-    } finally {
-      setBusy(false);
-    }
-  };
 
-  const apply = (d: NonNullable<Msg["design"]>) => {
-    const g = (["tee", "hoodie", "cap", "pants"] as const).includes(d.garment as any)
-      ? (d.garment as GarmentType)
-      : "hoodie";
-    onApply(g, d.color);
+    if (isVaguePrompt(text)) {
+      // vague / "surprise me" → 3 concrete ideas to pick from (§3)
+      setMessages((m) => [
+        ...m,
+        {
+          id: idRef.current++,
+          role: "assistant",
+          content: t("I got you! Here are 3 ideas — tap one and I'll design it:", "على راسي! هذي ٣ أفكار — اختر وحدة وأصممها لك:"),
+          ideas: suggestDesignIdeas(),
+        },
+      ]);
+      return;
+    }
+    await generate(text);
   };
 
   return (
@@ -112,18 +143,10 @@ export default function AIDesignChat({ onApply, lang }: Props) {
         </div>
         <div className="flex-1">
           <div className="text-xs font-bold uppercase tracking-widest">{t("AI Stylist", "المصمم الذكي")}</div>
-          <div className="text-[10px] text-white/40 -mt-0.5">{t("Designs for you", "يصمم لك")}</div>
+          <div className="text-[10px] text-white/40 -mt-0.5">{t("Creates real printable designs", "يولّد تصاميم حقيقية للطباعة")}</div>
         </div>
         <Sparkles size={14} className="text-fuchsia-300 animate-pulse" />
       </div>
-
-      {quota && quota.remaining <= 5 && (
-        <div className="px-3 py-1.5 bg-amber-500/10 border-b border-amber-400/20 text-[10px] text-amber-200 text-center">
-          {quota.remaining === 0
-            ? t("Message limit reached — try again in a few minutes.", "وصلت للحد الأقصى للرسائل — حاول بعد شوي.")
-            : t(`${quota.remaining} messages left for now`, `باقي لك ${quota.remaining} رسايل حالياً`)}
-        </div>
-      )}
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
         <AnimatePresence initial={false}>
@@ -138,25 +161,55 @@ export default function AIDesignChat({ onApply, lang }: Props) {
                 className={`max-w-[85%] rounded-2xl px-3 py-2 text-xs leading-relaxed ${
                   m.role === "user"
                     ? "bg-gradient-to-br from-cyan-500 to-fuchsia-500 text-black font-semibold"
-                    : "bg-white/[0.06] border border-white/10 text-white/90"
+                    : m.failed
+                      ? "bg-red-500/10 border border-red-400/30 text-red-100"
+                      : "bg-white/[0.06] border border-white/10 text-white/90"
                 }`}
               >
                 <div className="whitespace-pre-wrap">{m.content}</div>
-                {m.design && (
-                  <div className="mt-2 rounded-xl p-2 bg-black/40 border border-white/10">
-                    <div className="flex items-center gap-2 mb-2">
-                      <div className="w-6 h-6 rounded-md border border-white/20" style={{ background: m.design.color }} />
-                      <div className="w-6 h-6 rounded-md border border-white/20" style={{ background: m.design.accent }} />
-                      <span className="text-[10px] font-bold text-white/70 uppercase tracking-wide">{m.design.vibe}</span>
-                      <span className="ml-auto text-[10px] text-cyan-300 font-mono">{m.design.garment}</span>
-                    </div>
+
+                {/* 3 idea thumbnails for vague requests */}
+                {m.ideas && (
+                  <div className="grid grid-cols-3 gap-1.5 mt-2">
+                    {m.ideas.map((idea) => (
+                      <button
+                        key={idea.title}
+                        disabled={busy}
+                        onClick={() => {
+                          setMessages((ms) => [...ms, { id: idRef.current++, role: "user", content: idea.title }]);
+                          void generate(idea.prompt);
+                        }}
+                        className={`rounded-xl p-2 bg-gradient-to-br ${idea.gradient} border border-white/15 hover:border-cyan-300/60 flex flex-col items-center gap-1 transition disabled:opacity-40`}
+                      >
+                        <span className="text-xl leading-none">{idea.emoji}</span>
+                        <span className="text-[9px] font-black text-white/90 text-center leading-tight">{idea.title}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* generated design + apply button */}
+                {m.imageUrl && (
+                  <div className="mt-2 rounded-xl overflow-hidden bg-black/40 border border-white/10">
+                    <img src={m.imageUrl} alt="" className="w-full max-h-56 object-contain bg-[repeating-conic-gradient(#1a1a24_0%_25%,#101018_0%_50%)] bg-[length:22px_22px]" />
                     <button
-                      onClick={() => apply(m.design!)}
-                      className="w-full py-1.5 rounded-lg bg-gradient-to-r from-cyan-400 to-fuchsia-500 text-black font-black text-[11px] flex items-center justify-center gap-1 shadow-[0_0_15px_rgba(6,182,212,0.5)] hover:scale-[1.02] transition"
+                      onClick={() => onApplyDesign(m.imageUrl!)}
+                      className="w-full py-2 rounded-b-xl bg-gradient-to-r from-cyan-400 to-fuchsia-500 text-black font-black text-[11px] flex items-center justify-center gap-1 hover:brightness-110 transition"
                     >
-                      <Wand2 size={12} /> {t("Apply to Studio", "طبّق في الاستوديو")}
+                      <Wand2 size={12} /> {t("تطبيق على القطعة", "Apply to garment")}
                     </button>
                   </div>
+                )}
+
+                {/* retry button on failures */}
+                {m.failed && m.retryPrompt && (
+                  <button
+                    onClick={() => { setMessages((ms) => ms.filter((x) => x.id !== m.id)); void generate(m.retryPrompt!); }}
+                    disabled={busy}
+                    className="mt-2 w-full py-2 rounded-lg bg-white/10 border border-white/20 text-white/85 text-[11px] font-black flex items-center justify-center gap-1.5 hover:bg-white/20 transition disabled:opacity-40"
+                  >
+                    <RefreshCcw size={12} /> {t("إعادة المحاولة", "Try again")}
+                  </button>
                 )}
               </div>
             </motion.div>
@@ -165,7 +218,7 @@ export default function AIDesignChat({ onApply, lang }: Props) {
         {busy && (
           <div className="flex items-center gap-2 text-white/50 text-xs">
             <Loader2 size={12} className="animate-spin" />
-            {t("Designing…", "يصمم…")}
+            {t("جاري إنشاء التصميم…", "Creating your design…")}
           </div>
         )}
       </div>
@@ -191,7 +244,7 @@ export default function AIDesignChat({ onApply, lang }: Props) {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder={t("Describe a vibe…", "صف لي الأجواء…")}
+          placeholder={t("صف التصميم…", "Describe a design…")}
           className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-cyan-400/60 placeholder:text-white/30"
         />
         <button

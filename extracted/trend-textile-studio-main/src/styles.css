@@ -1,6 +1,10 @@
 @import "tailwindcss" source(none);
 @source "../src";
 @import "tw-animate-css";
+/* Arabic + display fonts for the studio Text tool (see FONTS in
+   paint-engine.ts). Must stay above everything else — CSS @import rules
+   are only valid at the top of a stylesheet. */
+@import url("https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&family=Tajawal:wght@400;700;900&family=Amiri:wght@400;700&family=Reem+Kufi:wght@400;700&display=swap");
 
 @custom-variant dark (&:is(.dark *));
 

@@ -36,6 +36,11 @@ export interface Studio3DHandle {
    *  evaluates what the garment really looks like instead of only the
    *  printed artwork. Returns null if the canvas hasn't mounted yet. */
   getSnapshotDataUrl: () => string | null;
+  /** Paint at a RAW texture coordinate (0..1, v measured from the canvas
+   *  top row — i.e. direct canvas space). Used by the 2D mockup board's
+   *  draw mode: drawing on a mockup panel paints the real 3D garment
+   *  texture in the matching region, live. */
+  paintAtTexturePoint: (u: number, v: number, down: boolean) => void;
 }
 
 interface Studio3DProps {
@@ -52,6 +57,13 @@ interface Studio3DProps {
    *  composited onto the same texture (see `compose()` below). */
   decalUrlBack?: string | null;
   decalTransformBack?: { x: number; y: number; scale: number; rotation: number; skewX?: number; skewY?: number };
+  /** Full-canvas (1024×1024) element overlays in RAW texture orientation
+   *  (see lib/designElements.ts). When set they are drawn 1:1 onto the
+   *  garment texture — the modern multi-element editor (images + text with
+   *  opacity/UV/lock etc.) renders into these, while decalUrl/decalUrlBack
+   *  stay as the pretty per-side previews used for saving/thumbnails. */
+  overlayFrontUrl?: string | null;
+  overlayBackUrl?: string | null;
   modelPath?: string | null;
   size?: SizeId;
   /** Base fabric of the garment — drives real PBR roughness/metalness/bump. */
@@ -192,13 +204,22 @@ function drawDecal(
   const h = w / aspect;
 
   let cx = texSize / 2 + x * texSize + sideShiftPx;
-  const cy = texSize / 2 + y * texSize;
+  // Orientation fix (the reported "upside-down image" bug): the garment
+  // texture is sampled with v pointing UP (tex.flipY = false below), while
+  // design-space y points DOWN. So BOTH the decal's vertical position and
+  // its internal orientation must be flipped when stamping it onto the
+  // paint canvas — translate to the mirrored y, then scale(1,-1) before
+  // rotating, so artwork appears on the 3D garment exactly as the person
+  // sees it in the 2D mockups (same math as composeElementsOverlay in
+  // lib/designElements.ts).
+  const cy = texSize / 2 - y * texSize;
   // wrap horizontally so back-shifted artwork re-enters from the other edge
   cx = ((cx % texSize) + texSize) % texSize;
 
   ctx.save();
   if (preset && preset.filter !== "none") ctx.filter = preset.filter;
   ctx.translate(cx, cy);
+  ctx.scale(1, -1);
   ctx.rotate((rotation * Math.PI) / 180);
   // Simplified 2-axis warp (skew/shear) — see DecalTransform.skewX/skewY
   // for why this is the scoped-down version instead of a full per-corner
@@ -224,12 +245,14 @@ function drawDecal(
   if (cx - w / 2 < 0 || cx + w / 2 > texSize) {
     ctx.save();
     ctx.translate(cx - texSize, cy);
+    ctx.scale(1, -1);
     ctx.rotate((rotation * Math.PI) / 180);
     if (skewX || skewY) ctx.transform(1, skewY, skewX, 1, 0, 0);
     ctx.drawImage(img, -w / 2, -h / 2, w, h);
     ctx.restore();
     ctx.save();
     ctx.translate(cx + texSize, cy);
+    ctx.scale(1, -1);
     ctx.rotate((rotation * Math.PI) / 180);
     if (skewX || skewY) ctx.transform(1, skewY, skewX, 1, 0, 0);
     ctx.drawImage(img, -w / 2, -h / 2, w, h);
@@ -705,6 +728,12 @@ export default forwardRef<Studio3DHandle, Studio3DProps>(function Studio3D(props
 
   const decalFrontImg = useDecalImage(props.decalUrl);
   const decalBackImg = useDecalImage(props.decalUrlBack);
+  const overlayFrontImg = useDecalImage(props.overlayFrontUrl);
+  const overlayBackImg = useDecalImage(props.overlayBackUrl);
+  // Always-fresh reference to the current paintAt (it closes over the
+  // current brush/layer each render) so the imperative handle never calls
+  // a stale one.
+  const paintAtRef = useRef<(uv: THREE.Vector2, down: boolean) => void>(() => {});
 
   useImperativeHandle(ref, () => ({
     getPaintDataUrl: () => {
@@ -725,6 +754,9 @@ export default forwardRef<Studio3DHandle, Studio3DProps>(function Studio3D(props
         // soft rather than crash the judge flow either way.
         return null;
       }
+    },
+    paintAtTexturePoint: (u: number, v: number, down: boolean) => {
+      paintAtRef.current(new THREE.Vector2(u, v), down);
     },
   }), [hasArtwork, layers.paint]);
 
@@ -751,6 +783,10 @@ export default forwardRef<Studio3DHandle, Studio3DProps>(function Studio3D(props
 
     o.clearRect(0, 0, TEX, TEX);
     o.drawImage(layers.base, 0, 0);
+    // Multi-element overlays (2D mockup board editor) — full-canvas images
+    // in raw texture orientation, drawn 1:1 with no placement math here.
+    if (overlayFrontImg) o.drawImage(overlayFrontImg, 0, 0, TEX, TEX);
+    if (overlayBackImg) o.drawImage(overlayBackImg, 0, 0, TEX, TEX);
     if (decalFrontImg) drawDecal(o, decalFrontImg, props.decalTransform, TEX, 0, props.decorationType);
     if (decalBackImg) drawDecal(o, decalBackImg, props.decalTransformBack, TEX, TEX / 2, props.decorationTypeBack);
     o.drawImage(layers.paint, 0, 0);
@@ -761,7 +797,7 @@ export default forwardRef<Studio3DHandle, Studio3DProps>(function Studio3D(props
   // just on color/paint changes like before, since decals are now baked
   // pixels instead of a live GPU texture offset.
   useEffect(() => { compose(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [
-    decalFrontImg, decalBackImg,
+    decalFrontImg, decalBackImg, overlayFrontImg, overlayBackImg,
     props.decalTransform?.x, props.decalTransform?.y, props.decalTransform?.scale, props.decalTransform?.rotation,
     props.decalTransformBack?.x, props.decalTransformBack?.y, props.decalTransformBack?.scale, props.decalTransformBack?.rotation,
     props.decorationType, props.decorationTypeBack,
@@ -844,6 +880,8 @@ export default forwardRef<Studio3DHandle, Studio3DProps>(function Studio3D(props
     setHasArtwork(true);
     recompositeLayers();
   };
+
+    paintAtRef.current = paintAt;
 
   useEffect(() => {
     const up = () => { gradStartRef.current = null; strokeRef.current = newStroke(); };
